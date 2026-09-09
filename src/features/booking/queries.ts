@@ -1,7 +1,7 @@
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from "drizzle-orm";
 
-import { db } from '@/db/client';
-import { bookings, parents, students, trialClasses } from '@/db/schema';
+import { db } from "@/db/client";
+import { bookings, parents, students, trialClasses } from "@/db/schema";
 
 export async function listStudents() {
   return db
@@ -71,7 +71,7 @@ export async function findClassRoster(trialClassId: string) {
     .where(
       and(
         eq(bookings.trialClassId, trialClassId),
-        eq(bookings.status, 'confirmed'),
+        eq(bookings.status, "confirmed"),
       ),
     )
     .orderBy(asc(bookings.confirmedAt), asc(bookings.id));

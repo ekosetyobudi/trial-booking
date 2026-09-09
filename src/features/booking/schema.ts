@@ -1,4 +1,4 @@
-import { z } from 'zod';
+import { z } from "zod";
 
 export const createBookingInput = z.strictObject({
   student_id: z.uuid(),

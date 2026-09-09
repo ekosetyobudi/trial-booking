@@ -1,6 +1,6 @@
-import { BookingError, errorStatus } from '@/features/booking/errors';
-import { createBookingInput } from '@/features/booking/schema';
-import { createBooking } from '@/features/booking/service';
+import { BookingError, errorStatus } from "@/features/booking/errors";
+import { createBookingInput } from "@/features/booking/schema";
+import { createBooking } from "@/features/booking/service";
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);
@@ -10,8 +10,8 @@ export async function POST(request: Request) {
     return Response.json(
       {
         error: {
-          code: 'INVALID_REQUEST',
-          message: 'Body must contain student_id and trial_class_id as UUIDs.',
+          code: "INVALID_REQUEST",
+          message: "Body must contain student_id and trial_class_id as UUIDs.",
         },
       },
       { status: 400 },
@@ -19,7 +19,10 @@ export async function POST(request: Request) {
   }
 
   try {
-    return Response.json({ booking: await createBooking(input.data) }, { status: 201 });
+    return Response.json(
+      { booking: await createBooking(input.data) },
+      { status: 201 },
+    );
   } catch (error) {
     // Anything that is not a domain error stays unmapped and surfaces as a 500,
     // so a raw Postgres error never reaches the client.

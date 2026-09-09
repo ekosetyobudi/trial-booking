@@ -289,3 +289,68 @@ booking per class. The other three are terminal and do not block a retry.
 
 A raw Postgres error is never surfaced. Any unmapped failure is a `500` with no
 error envelope.
+
+---
+
+## Tests
+
+```bash
+bun run test
+```
+
+Tests import the service directly rather than going through HTTP, so a failure
+points at the invariant rather than at routing or serialisation. Each test builds
+its own parent, student and class and never reads a seeded row.
+
+| Test | Proves |
+| --- | --- |
+| Paid booking reaches the roster | The confirm path writes `confirmed_at` and the roster reads it |
+| Duplicate live booking rejected | The partial unique index, surfaced as `DUPLICATE_BOOKING` |
+| Booking rejected on a full class | Capacity is refused at creation time |
+| Declined payment leaves the roster untouched | A failed charge never seats a student |
+| Two payments race the last seat | Exactly one `confirmed`, one `seat_unavailable`, 4 confirmed |
+
+The race test opens both pool connections before firing the two payments.
+postgres.js connects lazily, and a cold TLS handshake takes longer than the
+critical section, so without that step the second transaction starts after the
+first has committed and the test passes against a service with no lock at all.
+See NOTES.md.
+
+## What I'd monitor
+
+Each of these is something the test suite cannot observe, either because it is a
+production-rate signal or because it needs state the tests tear down.
+
+**`seat_unavailable` rate.** This status means a charge succeeded and the seat
+was gone, so every occurrence is money taken that owes a void. The race test
+proves one is produced correctly under contention; nothing in the system refunds
+it. Alert on any non-zero count in a window, not on a threshold, and reconcile
+each one against the payment provider.
+
+**`payment_failed` volume and its rate of change.** The mock charge is
+deterministic — the caller states the outcome — so the tests exercise the
+handling of a decline but say nothing about how often declines happen. A step
+change in this rate is a provider incident or a checkout regression, and it is
+indistinguishable from normal operation at any single request.
+
+**Lock wait time on `trial_classes` rows.** Payment serialises every payer for a
+class behind one row lock, which is what makes the invariant hold. The cost is
+queueing that grows with contention. The test races two payers; a popular class
+may race twenty, each waiting behind a transaction that includes a payment
+record write. Watch `pg_stat_activity` for `Lock` waits on that relation and the
+p99 duration of the pay endpoint. A rising wait is the signal to move the
+provider call out of the transaction before it becomes a timeout.
+
+**Drift between `payment_attempts.succeeded` and booking status.** Every
+successful attempt should correspond to a booking that is `confirmed` or
+`seat_unavailable`, and nothing else. A successful attempt against a booking
+still in `pending_payment` means a transaction committed the charge and lost the
+status, which no test asserts because each test checks only the booking it
+created. Run this as a periodic query across all rows; it is the one check that
+catches a partial write.
+
+**Bookings aged in `pending_payment`.** Nothing expires them, and they hold no
+seat, so they are invisible to capacity but they do block that student from
+rebooking the class through the live-booking unique index. The tests always pay
+or abandon within a single run, so the aged case never appears. Track the oldest
+`pending_payment` age per class.

@@ -1,0 +1,1 @@
+ALTER TABLE "trial_classes" ADD CONSTRAINT "capacity_positive" CHECK ("trial_classes"."capacity" > 0);

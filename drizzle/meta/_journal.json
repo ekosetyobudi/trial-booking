@@ -8,6 +8,13 @@
       "when": 1788937576650,
       "tag": "0000_gigantic_prima",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788946628184,
+      "tag": "0001_regular_tomorrow_man",
+      "breakpoints": true
     }
   ]
 }

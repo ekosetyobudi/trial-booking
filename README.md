@@ -1,8 +1,10 @@
 # Trial Booking
 
 Trial class booking for a tuition centre: a parent picks a student and a trial class,
-creates a booking, and pays for it. Capacity and duplicate rules are enforced in
-Postgres, so they hold across concurrent requests and multiple app instances.
+creates a booking, and pays for it. The duplicate rule is a Postgres constraint.
+Capacity is enforced by the service under a row lock, because a count across rows
+is not something a constraint can express. Neither depends on application timing,
+so both hold across concurrent requests and multiple app instances.
 
 ## Quick start
 
@@ -17,7 +19,11 @@ bun run dev
 ```
 
 The seed creates three classes of capacity 4 with 1, 3, and 4 confirmed bookings,
-so the open, one-seat-left, and full cases are all reachable without setup.
+so the open, one-seat-left, and full cases are all reachable without setup. It
+also leaves one student already confirmed in the open class, so a duplicate
+attempt is one click away, and one booking in `payment_failed` with its declined
+`payment_attempts` row, so the failure path is visible before anything is driven
+through the API.
 
 ## Schema
 
@@ -36,7 +42,7 @@ payment_attempts(id, booking_id -> bookings, succeeded, failure_reason, created_
 `status` is a Postgres enum, not a text column, so an unknown status fails at
 write time rather than surviving in a row nobody reads until it breaks a count.
 
-### Three constraints, and why each exists
+### Four constraints, and why each exists
 
 ```sql
 CREATE UNIQUE INDEX bookings_one_live_per_student_class
@@ -47,6 +53,9 @@ CREATE INDEX bookings_class_status ON bookings (trial_class_id, status);
 
 ALTER TABLE bookings ADD CONSTRAINT confirmed_at_consistent
   CHECK ((status = 'confirmed') = (confirmed_at IS NOT NULL));
+
+ALTER TABLE trial_classes ADD CONSTRAINT capacity_positive
+  CHECK (capacity > 0);
 ```
 
 **The unique index is partial, and it covers `pending_payment` as well as
@@ -70,6 +79,10 @@ the critical path of the one query that must not be slow.
 `confirmed` without `confirmed_at` and `confirmed_at` without `confirmed` are
 both rejected. That is what lets the roster promise a `confirmed_at` on every
 entry instead of defending against a null it can do nothing about.
+
+**Capacity must be positive.** It is the only input to every seat check, so a
+zero or negative value would make `CLASS_FULL` permanent and unexplainable. A
+class with no seats is not a class.
 
 ### Two statuses for one failed booking
 
@@ -104,7 +117,7 @@ Base URL `http://localhost:3000`. Every endpoint accepts and returns JSON only.
 
 **Error envelope**
 
-Every non-2xx response has this shape and no other:
+Every error this API raises deliberately has this shape:
 
 ```json
 { "error": { "code": "CLASS_FULL", "message": "Human-readable explanation." } }
@@ -205,10 +218,10 @@ Confirmed bookings for one class, ordered by `confirmed_at` ascending.
   `"bookings": []`. Only a class that does not exist returns `404`. Do not treat
   an empty array as a missing class.
 
-| Status | Code               | When                                |
-| ------ | ------------------ | ----------------------------------- |
-| 400    | `INVALID_REQUEST`  | `id` is not a UUID                  |
-| 404    | `CLASS_NOT_FOUND`  | `id` is a UUID with no matching row |
+| Status | Code              | When                                |
+| ------ | ----------------- | ----------------------------------- |
+| 400    | `INVALID_REQUEST` | `id` is not a UUID                  |
+| 404    | `CLASS_NOT_FOUND` | `id` is a UUID with no matching row |
 
 ---
 
@@ -243,13 +256,13 @@ Both fields are required UUIDs. Unknown fields are rejected.
 }
 ```
 
-| Status | Code                 | When                                                                 |
-| ------ | -------------------- | -------------------------------------------------------------------- |
-| 400    | `INVALID_REQUEST`    | Body is not JSON, a field is missing, or a UUID is malformed          |
-| 404    | `STUDENT_NOT_FOUND`  | `student_id` has no matching row                                      |
-| 404    | `CLASS_NOT_FOUND`    | `trial_class_id` has no matching row                                  |
-| 409    | `DUPLICATE_BOOKING`  | This student already has a **live** booking for this class            |
-| 409    | `CLASS_FULL`         | The class already has `capacity` **confirmed** bookings               |
+| Status | Code                | When                                                         |
+| ------ | ------------------- | ------------------------------------------------------------ |
+| 400    | `INVALID_REQUEST`   | Body is not JSON, a field is missing, or a UUID is malformed |
+| 404    | `STUDENT_NOT_FOUND` | `student_id` has no matching row                             |
+| 404    | `CLASS_NOT_FOUND`   | `trial_class_id` has no matching row                         |
+| 409    | `DUPLICATE_BOOKING` | This student already has a **live** booking for this class   |
+| 409    | `CLASS_FULL`        | The class already has `capacity` **confirmed** bookings      |
 
 **A seat is not reserved at this step.** Two parents may both hold a
 `pending_payment` booking for the same last seat; the race is settled at payment,
@@ -261,13 +274,21 @@ class again — that is a retry, not a duplicate.
 
 `DUPLICATE_BOOKING` does not return the id of the existing booking.
 
+**These are checked in order, not independently.** The class is looked up, then
+capacity, and only then does the insert run — so a request naming an unknown
+student against a full class returns `CLASS_FULL`, not `STUDENT_NOT_FOUND`. The
+existence of a student is only ever learned from the insert, which is what keeps
+that check free of a race.
+
 ---
 
 ### POST /api/bookings/[id]/pay
 
 Settles a `pending_payment` booking. Payment is a deterministic mock: the caller
-states the outcome, and it is never random. Every attempt is recorded, whether it
-succeeds or fails.
+states the outcome, and it is never random. Every attempt that reaches the
+provider is recorded, whether it succeeds or fails. A call rejected by the guards
+before that point — `BOOKING_NOT_FOUND` or `BOOKING_NOT_PENDING` — records
+nothing, because no charge was attempted.
 
 **Request**
 
@@ -306,13 +327,13 @@ to re-read to learn where the booking landed:
 }
 ```
 
-| Status | Code                  | `booking_status` | When                                                |
-| ------ | --------------------- | ---------------- | --------------------------------------------------- |
-| 400    | `INVALID_REQUEST`     | absent           | `id` is not a UUID, or `succeed` is missing/not a boolean |
-| 402    | `PAYMENT_FAILED`      | `payment_failed` | Called with `succeed: false`                        |
-| 404    | `BOOKING_NOT_FOUND`   | absent           | `id` is a UUID with no matching row                 |
-| 409    | `BOOKING_NOT_PENDING` | current status   | The booking is not in `pending_payment`             |
-| 409    | `CLASS_FULL`          | `seat_unavailable` | Charge succeeded, but the class filled up first   |
+| Status | Code                  | `booking_status`   | When                                                      |
+| ------ | --------------------- | ------------------ | --------------------------------------------------------- |
+| 400    | `INVALID_REQUEST`     | absent             | `id` is not a UUID, or `succeed` is missing/not a boolean |
+| 402    | `PAYMENT_FAILED`      | `payment_failed`   | Called with `succeed: false`                              |
+| 404    | `BOOKING_NOT_FOUND`   | absent             | `id` is a UUID with no matching row                       |
+| 409    | `BOOKING_NOT_PENDING` | current status     | The booking is not in `pending_payment`                   |
+| 409    | `CLASS_FULL`          | `seat_unavailable` | Charge succeeded, but the class filled up first           |
 
 Three points a client must handle correctly:
 
@@ -334,32 +355,34 @@ On the last seat, with several payments in flight at once, exactly one ends
 
 ### Booking statuses
 
-| Status            | Meaning                                                          | Holds a seat |
-| ----------------- | ---------------------------------------------------------------- | ------------ |
-| `pending_payment` | Booking created, not yet paid                                     | No           |
-| `confirmed`       | Paid and seated. `confirmed_at` is set                            | Yes          |
-| `payment_failed`  | Charge declined. No money moved                                   | No           |
-| `seat_unavailable`| Charge succeeded but the seat was gone. The charge must be voided | No           |
-| `cancelled`       | Reserved. No endpoint writes this status                          | No           |
+| Status             | Meaning                                                           | Holds a seat |
+| ------------------ | ----------------------------------------------------------------- | ------------ |
+| `pending_payment`  | Booking created, not yet paid                                     | No           |
+| `confirmed`        | Paid and seated. `confirmed_at` is set                            | Yes          |
+| `payment_failed`   | Charge declined. No money moved                                   | No           |
+| `seat_unavailable` | Charge succeeded but the seat was gone. The charge must be voided | No           |
+| `cancelled`        | Reserved. No endpoint writes this status                          | No           |
 
-`pending_payment` and `confirmed` are *live*: a student may hold at most one live
+`pending_payment` and `confirmed` are _live_: a student may hold at most one live
 booking per class. The other three are terminal and do not block a retry.
 
 ### Error codes
 
-| Code                  | HTTP | Endpoints                                    |
-| --------------------- | ---- | -------------------------------------------- |
-| `INVALID_REQUEST`     | 400  | any                                          |
-| `PAYMENT_FAILED`      | 402  | `POST /api/bookings/[id]/pay`                |
-| `STUDENT_NOT_FOUND`   | 404  | `POST /api/bookings`                         |
+| Code                  | HTTP | Endpoints                                            |
+| --------------------- | ---- | ---------------------------------------------------- |
+| `INVALID_REQUEST`     | 400  | any                                                  |
+| `PAYMENT_FAILED`      | 402  | `POST /api/bookings/[id]/pay`                        |
+| `STUDENT_NOT_FOUND`   | 404  | `POST /api/bookings`                                 |
 | `CLASS_NOT_FOUND`     | 404  | `GET /api/classes/[id]/roster`, `POST /api/bookings` |
-| `BOOKING_NOT_FOUND`   | 404  | `POST /api/bookings/[id]/pay`                |
-| `DUPLICATE_BOOKING`   | 409  | `POST /api/bookings`                         |
-| `CLASS_FULL`          | 409  | `POST /api/bookings`, `POST /api/bookings/[id]/pay` |
-| `BOOKING_NOT_PENDING` | 409  | `POST /api/bookings/[id]/pay`                |
+| `BOOKING_NOT_FOUND`   | 404  | `POST /api/bookings/[id]/pay`                        |
+| `DUPLICATE_BOOKING`   | 409  | `POST /api/bookings`                                 |
+| `CLASS_FULL`          | 409  | `POST /api/bookings`, `POST /api/bookings/[id]/pay`  |
+| `BOOKING_NOT_PENDING` | 409  | `POST /api/bookings/[id]/pay`                        |
 
-A raw Postgres error is never surfaced. Any unmapped failure is a `500` with no
-error envelope.
+A raw Postgres error is never surfaced. Anything unmapped — an unreachable
+database, a bug — is rethrown and becomes a framework `500` with no envelope, as
+is a request to a path or method that does not exist. Branch on the envelope when
+it is there; treat its absence as "the request never reached the domain".
 
 ---
 
@@ -383,11 +406,11 @@ BEGIN;
 COMMIT;
 ```
 
-**Why the class row and not the booking rows.** The two payers hold *different*
+**Why the class row and not the booking rows.** The two payers hold _different_
 booking rows, so locking those serialises nothing. A booking belongs to exactly
 one class, which makes the class row the one object both contenders must touch.
 It also happens to serialise the second race for free: two calls paying the
-*same* booking twice queue on the same row, so `BOOKING_NOT_PENDING` is decided
+_same_ booking twice queue on the same row, so `BOOKING_NOT_PENDING` is decided
 under the same lock rather than by a status read that was true a moment ago.
 
 **Why the count is taken after the lock, never before.** `capacity` comes from
@@ -419,7 +442,7 @@ into a refused booking.
 
 **`SERIALIZABLE` isolation** — let Postgres detect the anomaly. Rejected for the
 same reason as optimistic locking: it surfaces as a serialization failure the
-application must retry, after the charge. `FOR UPDATE` blocks *before* any money
+application must retry, after the charge. `FOR UPDATE` blocks _before_ any money
 moves, which is the ordering that matters.
 
 **A unique constraint on (class, seat_number)** — make the database refuse the
@@ -452,18 +475,45 @@ the payment provider integration that does not exist here.
 
 ### Where each invariant is enforced
 
-| Invariant | Enforced by |
-| --- | --- |
-| No duplicate live booking per student + class | Postgres partial unique index |
-| `confirmed` always has a `confirmed_at` | Postgres check constraint |
-| A failed payment never confirms | Service: status written before the confirm branch is reachable |
-| Confirmed never exceeds capacity | Service: recount under `FOR UPDATE` on the class row |
+| Invariant                                     | Enforced by                                                    |
+| --------------------------------------------- | -------------------------------------------------------------- |
+| No duplicate live booking per student + class | Postgres partial unique index                                  |
+| `confirmed` always has a `confirmed_at`       | Postgres check constraint                                      |
+| A failed payment never confirms               | Service: status written before the confirm branch is reachable |
+| Confirmed never exceeds capacity              | Service: recount under `FOR UPDATE` on the class row           |
 
 The first two survive anything that writes to the database, including psql. The
 last two need the transaction, so they live in `service.ts` — which is why tests
 import the service directly rather than driving it over HTTP.
 
 ---
+
+## The page
+
+`/` is the whole UI. Pick a student and a trial class, create the booking, then
+settle it with one of two mock pay actions and see where it landed. It exists to
+demonstrate the flow, not to be a product: the spec does not ask for a polished
+frontend, so every minute beyond "the flow is visible and the errors are legible"
+went into the backend instead.
+
+It talks to nothing but the documented HTTP API. `/` is a Server Component
+holding the heading; all interaction lives in one `'use client'` component that
+fetches from the route handlers in the browser. Components are barred from the
+database, and a Server Component cannot call its own route handlers without an
+absolute origin and a new required env var, so the data is fetched client-side.
+The cost is no server-rendered data and no loading state, both accepted.
+
+Three behaviours worth knowing before clicking:
+
+- **Full classes stay selectable.** That is the only way to reach `CLASS_FULL`
+  from the page. The UI is not where capacity is enforced.
+- **Both pay buttons disable once the booking leaves `pending_payment`,** which
+  also makes `BOOKING_NOT_PENDING` unreachable from the page. It is covered by
+  tests and reachable with curl.
+- **The class list is refetched only after a payment settles,** because creating
+  a booking changes no confirmed count.
+
+The roster has no UI. It is served by `GET /api/classes/[id]/roster`.
 
 ## Tests
 
@@ -475,19 +525,28 @@ Tests import the service directly rather than going through HTTP, so a failure
 points at the invariant rather than at routing or serialisation. Each test builds
 its own parent, student and class and never reads a seeded row.
 
-| Test | Proves |
-| --- | --- |
-| Paid booking reaches the roster | The confirm path writes `confirmed_at` and the roster reads it |
-| Duplicate live booking rejected | The partial unique index, surfaced as `DUPLICATE_BOOKING` |
-| Booking rejected on a full class | Capacity is refused at creation time |
-| Declined payment leaves the roster untouched | A failed charge never seats a student |
-| Two payments race the last seat | Exactly one `confirmed`, one `seat_unavailable`, 4 confirmed |
+| Test                                         | Proves                                                                           |
+| -------------------------------------------- | -------------------------------------------------------------------------------- |
+| Paid booking reaches the roster              | The confirm path writes `confirmed_at` and the roster reads it                   |
+| Duplicate live booking rejected              | The partial unique index, surfaced as `DUPLICATE_BOOKING`                        |
+| Booking rejected on a full class             | Capacity is refused at creation time                                             |
+| Declined payment leaves the roster untouched | A failed charge never seats a student                                            |
+| Two payments race the last seat              | Exactly one `confirmed`, one `seat_unavailable`, 4 confirmed                     |
+| Two payments race the same booking           | Exactly one `confirmed`, one `BOOKING_NOT_PENDING`, and only one charge recorded |
+| A settled booking cannot be paid again       | A terminal status is not resurrected, and no second charge is written            |
+| Paying an unknown id                         | `BOOKING_NOT_FOUND`                                                              |
 
-The race test opens both pool connections before firing the two payments.
+Both race tests were checked against a broken implementation before being
+trusted. With `FOR UPDATE` removed, the last-seat test fails ten runs out of ten
+and the same-booking test fails five out of five, the latter confirming one
+booking twice and recording two charges for it. Restored, both pass every run.
+
+The race tests open both pool connections before firing the two payments.
 postgres.js connects lazily, and a cold TLS handshake takes longer than the
 critical section, so without that step the second transaction starts after the
 first has committed and the test passes against a service with no lock at all.
-See NOTES.md.
+This was found by deleting the lock and watching the test stay green; see
+AI_USAGE.md.
 
 ## What I'd monitor
 
@@ -527,3 +586,78 @@ seat, so they are invisible to capacity but they do block that student from
 rebooking the class through the live-booking unique index. The tests always pay
 or abandon within a single run, so the aged case never appears. Track the oldest
 `pending_payment` age per class.
+
+## Where each check belongs
+
+The same rule is often worth stating in more than one place, but only one of
+them is the enforcement. This is the split.
+
+| Layer          | Owns                                                        | Example                                                              |
+| -------------- | ----------------------------------------------------------- | -------------------------------------------------------------------- |
+| UI             | Nothing. Guidance only                                      | Disables the pay buttons on a settled booking                        |
+| Route handler  | Request shape, and the mapping from domain error to status  | zod rejects a malformed uuid as `INVALID_REQUEST`                    |
+| Service        | Every transition, and capacity under a lock                 | Recount after `FOR UPDATE`, confirm only while `count < capacity`    |
+| Database       | The invariants that must survive any writer, including psql | Partial unique index, `confirmed_at_consistent`, `capacity_positive` |
+| Background job | Nothing yet — this is the gap                               | Voiding `seat_unavailable` charges, expiring aged `pending_payment`  |
+
+A check in the UI is a courtesy to the user. A check in the service holds for
+every caller of the service. A check in the database holds for everyone,
+including a migration or an admin at a psql prompt, which is why the two rules
+that must never break live there.
+
+## Assumptions
+
+- A student may hold one live booking per class. A booking that ended
+  `payment_failed`, `seat_unavailable` or `cancelled` is a retry, not a
+  duplicate.
+- Payment is a deterministic mock driven by the caller. There is no provider, no
+  idempotency key, and no webhook, so nothing here can be replayed or reconciled
+  against an external system.
+- No authentication. `student_id` is taken from the request body rather than a
+  session, and the roster is open.
+- Trial classes have no seat identity, no waitlist, and no cancellation flow.
+- One Postgres, reached through the Supabase session pooler. Capacity is
+  single-digit, as a trial class is.
+- Timestamps are stored and returned in UTC.
+
+## What I deliberately cut
+
+Each of these was a decision, not an oversight.
+
+| Cut                                       | Why                                                                                                                                                                                  |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Authentication and authorisation          | The exercise is about booking correctness. In production the roster would sit behind teacher/admin authorisation and bookings would derive the parent from the session, not the body |
+| Voiding a `seat_unavailable` charge       | There is no payment provider to void against. The status exists precisely so the obligation is queryable; issuing the refund belongs to the integration that does not exist here     |
+| `lock_timeout` on the payment transaction | Costs liveness, never correctness. Worth adding the moment there is a real gateway call anywhere near the lock                                                                       |
+| Expiring aged `pending_payment` bookings  | Needs a background job and a timeout nobody can pick correctly yet. They hold no seat, so nothing overbooks; they only block that student from rebooking                             |
+| Pagination on the list endpoints          | Three classes and ten students. Adding it now would be shape without a reason                                                                                                        |
+| `ON DELETE` behaviour on the foreign keys | All `NO ACTION`. Nothing in this slice deletes a class or a student                                                                                                                  |
+| A polished frontend                       | The spec says it is not required, and every minute spent there is a minute not spent on the invariants that are graded                                                               |
+| HTTP-level tests                          | Tests import the service directly, which is why that boundary exists. The route handlers are thin enough that curl covers them                                                       |
+
+## Next steps
+
+In the order I would actually do them:
+
+1. **Move the charge out of the transaction.** Charge first, then hold the lock
+   only around the recount and the confirm. This is the one change the current
+   design is waiting on, and the reconciliation path for a crash between the two
+   is the larger half of the work.
+2. **A void job for `seat_unavailable`.** Every row is money owed back. It needs
+   the provider integration from step 1.
+3. **Authentication**, so `parent_id` comes from a session and the roster is not
+   open.
+4. **Expiry for aged `pending_payment` bookings**, once there is data on how long
+   a real checkout takes.
+5. **`lock_timeout` plus the monitoring below**, so a slow payer degrades
+   visibly instead of silently.
+
+## Time spent
+
+Around 3 hours.
+
+## Video walkthrough
+
+TBD
+
+<!-- TODO: paste the unlisted recording link here before submitting. -->

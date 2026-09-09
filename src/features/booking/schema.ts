@@ -6,3 +6,9 @@ export const createBookingInput = z.strictObject({
 });
 
 export type CreateBookingInput = z.infer<typeof createBookingInput>;
+
+export const payBookingInput = z.strictObject({
+  succeed: z.boolean(),
+});
+
+export type PayBookingInput = z.infer<typeof payBookingInput>;

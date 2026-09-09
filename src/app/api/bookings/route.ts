@@ -1,13 +1,6 @@
-import { BookingError, type BookingErrorCode } from '@/features/booking/errors';
+import { BookingError, errorStatus } from '@/features/booking/errors';
 import { createBookingInput } from '@/features/booking/schema';
 import { createBooking } from '@/features/booking/service';
-
-const errorStatus: Record<BookingErrorCode, number> = {
-  STUDENT_NOT_FOUND: 404,
-  CLASS_NOT_FOUND: 404,
-  DUPLICATE_BOOKING: 409,
-  CLASS_FULL: 409,
-};
 
 export async function POST(request: Request) {
   const body = await request.json().catch(() => null);

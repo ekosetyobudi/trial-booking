@@ -3,10 +3,10 @@ import { DrizzleQueryError } from 'drizzle-orm/errors';
 import postgres from 'postgres';
 
 import { db } from '@/db/client';
-import { bookings, trialClasses } from '@/db/schema';
+import { bookings, paymentAttempts, trialClasses } from '@/db/schema';
 
 import { BookingError } from './errors';
-import type { CreateBookingInput } from './schema';
+import type { CreateBookingInput, PayBookingInput } from './schema';
 
 const UNIQUE_VIOLATION = '23505';
 const FOREIGN_KEY_VIOLATION = '23503';
@@ -96,4 +96,133 @@ export async function createBooking(input: CreateBookingInput) {
 
     throw error;
   }
+}
+
+const PAYMENT_DECLINED = 'Declined by the payment provider.';
+const SEAT_TAKEN = 'The class filled up before the payment settled.';
+
+// Payment is where the seat race is settled, so the whole call is one
+// transaction. The mock charge is a local insert; a real provider call must not
+// be made under the class lock, because it would hold it across the network.
+export async function payBooking(bookingId: string, input: PayBookingInput) {
+  const outcome = await db.transaction(async (tx) => {
+    // Reads only what identifies the row to lock. The status is deliberately
+    // left out: any status read before the lock is a fact about the past.
+    const [target] = await tx
+      .select({ trialClassId: bookings.trialClassId })
+      .from(bookings)
+      .where(eq(bookings.id, bookingId));
+
+    if (!target) {
+      return { error: new BookingError('BOOKING_NOT_FOUND', 'No booking with that id.') };
+    }
+
+    // The class row is the mutex for both races. A booking belongs to exactly
+    // one class, so competing payers for the last seat and repeat payers of one
+    // booking all serialise here. capacity comes from the locked row itself.
+    const [trialClass] = await tx
+      .select({ capacity: trialClasses.capacity })
+      .from(trialClasses)
+      .where(eq(trialClasses.id, target.trialClassId))
+      .for('update');
+
+    // Unreachable while the foreign key stands. Guarded because the compiler
+    // does not narrow a destructured row to undefined under this tsconfig.
+    if (!trialClass) {
+      throw new Error('payBooking: booking references a missing trial class');
+    }
+
+    // Re-read under the lock, and reject before anything is recorded. Paying an
+    // already confirmed booking would otherwise recount the class with that
+    // booking included and flip it to seat_unavailable.
+    const [booking] = await tx.select().from(bookings).where(eq(bookings.id, bookingId));
+
+    if (!booking) {
+      return { error: new BookingError('BOOKING_NOT_FOUND', 'No booking with that id.') };
+    }
+
+    if (booking.status !== 'pending_payment') {
+      return {
+        error: new BookingError(
+          'BOOKING_NOT_PENDING',
+          'This booking is not awaiting payment.',
+          booking.status,
+        ),
+      };
+    }
+
+    await tx.insert(paymentAttempts).values({
+      bookingId: booking.id,
+      succeeded: input.succeed,
+      failureReason: input.succeed ? null : PAYMENT_DECLINED,
+    });
+
+    if (!input.succeed) {
+      await tx
+        .update(bookings)
+        .set({ status: 'payment_failed', statusReason: PAYMENT_DECLINED })
+        .where(eq(bookings.id, booking.id));
+
+      return {
+        error: new BookingError('PAYMENT_FAILED', 'The payment was declined.', 'payment_failed'),
+      };
+    }
+
+    // Counted after the lock, never before. capacity sits on the locked row but
+    // the confirmed total lives in another table that any other payer can
+    // change; every competitor is held at the lock until this transaction ends.
+    const [seats] = await tx
+      .select({ confirmed: count() })
+      .from(bookings)
+      .where(
+        and(
+          eq(bookings.trialClassId, target.trialClassId),
+          eq(bookings.status, 'confirmed'),
+        ),
+      );
+
+    if (seats.confirmed >= trialClass.capacity) {
+      await tx
+        .update(bookings)
+        .set({ status: 'seat_unavailable', statusReason: SEAT_TAKEN })
+        .where(eq(bookings.id, booking.id));
+
+      // The charge stands and the attempt row keeps succeeded = true, so this
+      // is not a payment failure: it is a successful charge that owes a void.
+      return {
+        error: new BookingError(
+          'CLASS_FULL',
+          'The last seat was taken while the payment was being processed.',
+          'seat_unavailable',
+        ),
+      };
+    }
+
+    // No status predicate on the update. The status was read under the lock and
+    // no other path writes it, so a predicate would only turn a bug into a
+    // silent zero-row update.
+    const [confirmed] = await tx
+      .update(bookings)
+      .set({ status: 'confirmed', confirmedAt: new Date() })
+      .where(eq(bookings.id, booking.id))
+      .returning();
+
+    return { booking: confirmed };
+  });
+
+  // Built inside the transaction, thrown after it commits. Throwing inside
+  // would roll back the payment_attempts row and the status that together
+  // record a charge the parent actually made.
+  if ('error' in outcome) {
+    throw outcome.error;
+  }
+
+  return {
+    id: outcome.booking.id,
+    student_id: outcome.booking.studentId,
+    trial_class_id: outcome.booking.trialClassId,
+    status: outcome.booking.status,
+    confirmed_at: outcome.booking.confirmedAt?.toISOString() ?? null,
+    created_at: outcome.booking.createdAt.toISOString(),
+  };
 }

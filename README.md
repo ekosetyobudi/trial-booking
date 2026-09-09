@@ -194,8 +194,6 @@ class again — that is a retry, not a duplicate.
 
 ### POST /api/bookings/[id]/pay
 
-> Not implemented yet. This contract is fixed and clients may build against it.
-
 Settles a `pending_payment` booking. Payment is a deterministic mock: the caller
 states the outcome, and it is never random. Every attempt is recorded, whether it
 succeeds or fails.

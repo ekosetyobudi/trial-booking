@@ -15,6 +15,13 @@
       "when": 1788946628184,
       "tag": "0001_regular_tomorrow_man",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788947866555,
+      "tag": "0002_abnormal_mockingbird",
+      "breakpoints": true
     }
   ]
 }

@@ -27,7 +27,9 @@ export type BookingStatus = (typeof bookingStatus.enumValues)[number];
 export const parents = pgTable("parents", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: text("name").notNull(),
-  email: text("email").notNull(),
+  // A parent is identified by their email, so two rows sharing one are the same
+  // person recorded twice, and every booking under the duplicate is misfiled.
+  email: text("email").notNull().unique(),
 });
 
 export const students = pgTable("students", {

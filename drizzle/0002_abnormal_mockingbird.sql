@@ -1,0 +1,1 @@
+ALTER TABLE "parents" ADD CONSTRAINT "parents_email_unique" UNIQUE("email");

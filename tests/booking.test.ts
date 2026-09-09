@@ -60,7 +60,12 @@ async function buildScenario(
 ) {
   const [parent] = await db
     .insert(parents)
-    .values({ name: `${label} Parent`, email: `${label}@test.invalid` })
+    // Unique per run: parents.email is unique, so a fixed address would make a
+    // crashed run's leftover row fail the next one for the wrong reason.
+    .values({
+      name: `${label} Parent`,
+      email: `${label}-${randomUUID()}@test.invalid`,
+    })
     .returning();
   createdParentIds.push(parent.id);
 

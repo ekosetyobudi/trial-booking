@@ -143,8 +143,6 @@ Confirmed bookings for one class, ordered by `confirmed_at` ascending.
 
 ### POST /api/bookings
 
-> Not implemented yet. This contract is fixed and clients may build against it.
-
 Creates a booking in `pending_payment`. Creating a booking does not charge
 anything and does not hold a seat.
 

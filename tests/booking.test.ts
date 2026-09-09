@@ -1,11 +1,19 @@
-import { and, count, eq, inArray, sql } from 'drizzle-orm';
-import { afterEach, expect, test } from 'vitest';
+import { randomUUID } from "node:crypto";
 
-import { db } from '@/db/client';
-import { bookings, parents, paymentAttempts, students, trialClasses } from '@/db/schema';
-import { BookingError } from '@/features/booking/errors';
-import { findClassRoster } from '@/features/booking/queries';
-import { createBooking, payBooking } from '@/features/booking/service';
+import { and, count, eq, inArray, sql } from "drizzle-orm";
+import { afterEach, expect, test } from "vitest";
+
+import { db } from "@/db/client";
+import {
+  bookings,
+  parents,
+  paymentAttempts,
+  students,
+  trialClasses,
+} from "@/db/schema";
+import { BookingError } from "@/features/booking/errors";
+import { findClassRoster } from "@/features/booking/queries";
+import { createBooking, payBooking } from "@/features/booking/service";
 
 // Every test builds its own parent, student and class. Seeded rows exist for
 // the demo and are mutated by hand, so a test that read them would pass or fail
@@ -25,7 +33,9 @@ afterEach(async () => {
     const bookingIds = rows.map((row) => row.id);
 
     if (bookingIds.length > 0) {
-      await db.delete(paymentAttempts).where(inArray(paymentAttempts.bookingId, bookingIds));
+      await db
+        .delete(paymentAttempts)
+        .where(inArray(paymentAttempts.bookingId, bookingIds));
       await db.delete(bookings).where(inArray(bookings.id, bookingIds));
     }
   }
@@ -43,7 +53,11 @@ afterEach(async () => {
   }
 });
 
-async function buildScenario(label: string, studentCount: number, capacity: number) {
+async function buildScenario(
+  label: string,
+  studentCount: number,
+  capacity: number,
+) {
   const [parent] = await db
     .insert(parents)
     .values({ name: `${label} Parent`, email: `${label}@test.invalid` })
@@ -82,7 +96,12 @@ async function countConfirmed(trialClassId: string) {
   const [row] = await db
     .select({ confirmed: count() })
     .from(bookings)
-    .where(and(eq(bookings.trialClassId, trialClassId), eq(bookings.status, 'confirmed')));
+    .where(
+      and(
+        eq(bookings.trialClassId, trialClassId),
+        eq(bookings.status, "confirmed"),
+      ),
+    );
 
   return row.confirmed;
 }
@@ -105,36 +124,48 @@ async function readStatus(bookingId: string) {
   return row.status;
 }
 
-test('a paid booking is confirmed and appears in the roster', async () => {
-  const { students: [student], trialClass } = await buildScenario('Happy', 1, 4);
+test("a paid booking is confirmed and appears in the roster", async () => {
+  const {
+    students: [student],
+    trialClass,
+  } = await buildScenario("Happy", 1, 4);
 
   const created = await createBooking({
     student_id: student.id,
     trial_class_id: trialClass.id,
   });
-  expect(created.status).toBe('pending_payment');
+  expect(created.status).toBe("pending_payment");
   expect(created.confirmed_at).toBeNull();
 
   const paid = await payBooking(created.id, { succeed: true });
-  expect(paid.status).toBe('confirmed');
+  expect(paid.status).toBe("confirmed");
   expect(paid.confirmed_at).not.toBeNull();
 
   const roster = await findClassRoster(trialClass.id);
   expect(roster).toEqual({
     class_id: trialClass.id,
-    bookings: [{ id: created.id, student: { id: student.id, name: student.name }, confirmed_at: paid.confirmed_at }],
+    bookings: [
+      {
+        id: created.id,
+        student: { id: student.id, name: student.name },
+        confirmed_at: paid.confirmed_at,
+      },
+    ],
   });
 });
 
-test('a second live booking for the same student and class is rejected', async () => {
-  const { students: [student], trialClass } = await buildScenario('Duplicate', 1, 4);
+test("a second live booking for the same student and class is rejected", async () => {
+  const {
+    students: [student],
+    trialClass,
+  } = await buildScenario("Duplicate", 1, 4);
 
   const first = await createBooking({
     student_id: student.id,
     trial_class_id: trialClass.id,
   });
 
-  expect(first.status).toBe('pending_payment');
+  expect(first.status).toBe("pending_payment");
 
   const duplicate = await createBooking({
     student_id: student.id,
@@ -145,11 +176,14 @@ test('a second live booking for the same student and class is rejected', async (
   );
 
   expect(duplicate).toBeInstanceOf(BookingError);
-  expect(duplicate).toMatchObject({ code: 'DUPLICATE_BOOKING' });
+  expect(duplicate).toMatchObject({ code: "DUPLICATE_BOOKING" });
 });
 
-test('a booking is rejected once the class has no free seat', async () => {
-  const { students: [seated, latecomer], trialClass } = await buildScenario('Overbooking', 2, 1);
+test("a booking is rejected once the class has no free seat", async () => {
+  const {
+    students: [seated, latecomer],
+    trialClass,
+  } = await buildScenario("Overbooking", 2, 1);
 
   const filling = await createBooking({
     student_id: seated.id,
@@ -166,12 +200,15 @@ test('a booking is rejected once the class has no free seat', async () => {
   );
 
   expect(rejected).toBeInstanceOf(BookingError);
-  expect(rejected).toMatchObject({ code: 'CLASS_FULL' });
+  expect(rejected).toMatchObject({ code: "CLASS_FULL" });
   expect(await countConfirmed(trialClass.id)).toBe(1);
 });
 
-test('a declined payment leaves the roster untouched', async () => {
-  const { students: [seated, declined], trialClass } = await buildScenario('Decline', 2, 4);
+test("a declined payment leaves the roster untouched", async () => {
+  const {
+    students: [seated, declined],
+    trialClass,
+  } = await buildScenario("Decline", 2, 4);
 
   const confirmed = await createBooking({
     student_id: seated.id,
@@ -189,8 +226,11 @@ test('a declined payment leaves the roster untouched', async () => {
   const outcome = await settle(payBooking(failing.id, { succeed: false }));
 
   expect(outcome.error).toBeInstanceOf(BookingError);
-  expect(outcome.error).toMatchObject({ code: 'PAYMENT_FAILED', status: 'payment_failed' });
-  expect(await readStatus(failing.id)).toBe('payment_failed');
+  expect(outcome.error).toMatchObject({
+    code: "PAYMENT_FAILED",
+    status: "payment_failed",
+  });
+  expect(await readStatus(failing.id)).toBe("payment_failed");
   expect(await findClassRoster(trialClass.id)).toEqual(rosterBefore);
 
   const [attempt] = await db
@@ -200,8 +240,8 @@ test('a declined payment leaves the roster untouched', async () => {
   expect(attempt.succeeded).toBe(false);
 });
 
-test('two payments racing for the last seat produce one confirmed booking', async () => {
-  const { students, trialClass } = await buildScenario('Race', 5, 4);
+test("two payments racing for the last seat produce one confirmed booking", async () => {
+  const { students, trialClass } = await buildScenario("Race", 5, 4);
   const [first, second, third, ...contenders] = students;
 
   for (const student of [first, second, third]) {
@@ -217,12 +257,15 @@ test('two payments racing for the last seat produce one confirmed booking', asyn
   const pending = [];
   for (const student of contenders) {
     pending.push(
-      await createBooking({ student_id: student.id, trial_class_id: trialClass.id }),
+      await createBooking({
+        student_id: student.id,
+        trial_class_id: trialClass.id,
+      }),
     );
   }
   expect(pending.map((booking) => booking.status)).toEqual([
-    'pending_payment',
-    'pending_payment',
+    "pending_payment",
+    "pending_payment",
   ]);
 
   await openConnections(pending.length);
@@ -233,18 +276,112 @@ test('two payments racing for the last seat produce one confirmed booking', asyn
     pending.map((booking) => settle(payBooking(booking.id, { succeed: true }))),
   );
 
-  const winners = outcomes.filter((outcome) => outcome.value?.status === 'confirmed');
+  const winners = outcomes.filter(
+    (outcome) => outcome.value?.status === "confirmed",
+  );
   const losers = outcomes.filter(
-    (outcome) => outcome.error instanceof BookingError && outcome.error.code === 'CLASS_FULL',
+    (outcome) =>
+      outcome.error instanceof BookingError &&
+      outcome.error.code === "CLASS_FULL",
   );
 
   expect(winners).toHaveLength(1);
   expect(losers).toHaveLength(1);
-  expect(losers[0].error).toMatchObject({ status: 'seat_unavailable' });
+  expect(losers[0].error).toMatchObject({ status: "seat_unavailable" });
 
-  const statuses = await Promise.all(pending.map((booking) => readStatus(booking.id)));
-  expect(statuses.filter((status) => status === 'confirmed')).toHaveLength(1);
-  expect(statuses.filter((status) => status === 'seat_unavailable')).toHaveLength(1);
+  const statuses = await Promise.all(
+    pending.map((booking) => readStatus(booking.id)),
+  );
+  expect(statuses.filter((status) => status === "confirmed")).toHaveLength(1);
+  expect(
+    statuses.filter((status) => status === "seat_unavailable"),
+  ).toHaveLength(1);
 
   expect(await countConfirmed(trialClass.id)).toBe(4);
+});
+
+test("two payments racing for the same booking confirm it once", async () => {
+  const {
+    students: [student],
+    trialClass,
+  } = await buildScenario("DoublePay", 1, 4);
+
+  const booking = await createBooking({
+    student_id: student.id,
+    trial_class_id: trialClass.id,
+  });
+
+  await openConnections(2);
+
+  // The class row is the mutex for this race too. Both payers hold the same
+  // booking, so the loser reads its status only after the winner has committed
+  // rather than from before the lock was taken.
+  const outcomes = await Promise.all([
+    settle(payBooking(booking.id, { succeed: true })),
+    settle(payBooking(booking.id, { succeed: true })),
+  ]);
+
+  const winners = outcomes.filter(
+    (outcome) => outcome.value?.status === "confirmed",
+  );
+  const losers = outcomes.filter(
+    (outcome) =>
+      outcome.error instanceof BookingError &&
+      outcome.error.code === "BOOKING_NOT_PENDING",
+  );
+
+  expect(winners).toHaveLength(1);
+  expect(losers).toHaveLength(1);
+  expect(losers[0].error).toMatchObject({ status: "confirmed" });
+
+  expect(await readStatus(booking.id)).toBe("confirmed");
+  expect(await countConfirmed(trialClass.id)).toBe(1);
+
+  // One charge, not two. The status guard runs before payment_attempts is
+  // written, so the loser is rejected without any money being recorded.
+  const attempts = await db
+    .select({ id: paymentAttempts.id })
+    .from(paymentAttempts)
+    .where(eq(paymentAttempts.bookingId, booking.id));
+  expect(attempts).toHaveLength(1);
+});
+
+test("a booking that already settled cannot be paid again", async () => {
+  const {
+    students: [student],
+    trialClass,
+  } = await buildScenario("Settled", 1, 4);
+
+  const booking = await createBooking({
+    student_id: student.id,
+    trial_class_id: trialClass.id,
+  });
+  await settle(payBooking(booking.id, { succeed: false }));
+  expect(await readStatus(booking.id)).toBe("payment_failed");
+
+  const retried = await settle(payBooking(booking.id, { succeed: true }));
+
+  expect(retried.error).toBeInstanceOf(BookingError);
+  expect(retried.error).toMatchObject({
+    code: "BOOKING_NOT_PENDING",
+    status: "payment_failed",
+  });
+
+  // A terminal booking is not resurrected by a second attempt, and the declined
+  // charge stays the only one on record.
+  expect(await readStatus(booking.id)).toBe("payment_failed");
+  expect(await countConfirmed(trialClass.id)).toBe(0);
+
+  const attempts = await db
+    .select({ succeeded: paymentAttempts.succeeded })
+    .from(paymentAttempts)
+    .where(eq(paymentAttempts.bookingId, booking.id));
+  expect(attempts).toEqual([{ succeeded: false }]);
+});
+
+test("paying a booking that does not exist is rejected", async () => {
+  const outcome = await settle(payBooking(randomUUID(), { succeed: true }));
+
+  expect(outcome.error).toBeInstanceOf(BookingError);
+  expect(outcome.error).toMatchObject({ code: "BOOKING_NOT_FOUND" });
 });

@@ -19,6 +19,77 @@ bun run dev
 The seed creates three classes of capacity 4 with 1, 3, and 4 confirmed bookings,
 so the open, one-seat-left, and full cases are all reachable without setup.
 
+## Schema
+
+Five tables. `payment_attempts` records every charge; everything else is the
+booking chain.
+
+```
+parents(id, name, email)
+students(id, parent_id -> parents, name)
+trial_classes(id, subject, starts_at, capacity default 4)
+bookings(id, student_id -> students, trial_class_id -> trial_classes,
+         status, confirmed_at, status_reason, created_at, updated_at)
+payment_attempts(id, booking_id -> bookings, succeeded, failure_reason, created_at)
+```
+
+`status` is a Postgres enum, not a text column, so an unknown status fails at
+write time rather than surviving in a row nobody reads until it breaks a count.
+
+### Three constraints, and why each exists
+
+```sql
+CREATE UNIQUE INDEX bookings_one_live_per_student_class
+  ON bookings (student_id, trial_class_id)
+  WHERE status IN ('pending_payment', 'confirmed');
+
+CREATE INDEX bookings_class_status ON bookings (trial_class_id, status);
+
+ALTER TABLE bookings ADD CONSTRAINT confirmed_at_consistent
+  CHECK ((status = 'confirmed') = (confirmed_at IS NOT NULL));
+```
+
+**The unique index is partial, and it covers `pending_payment` as well as
+`confirmed`.** Covering only `confirmed` would let a parent who double-clicks
+accumulate pending bookings for the same class, and each one is a chargeable
+row. Covering every status would be worse: a parent whose card was declined
+could never retry, because the dead `payment_failed` row would block them
+forever. The three terminal statuses fall out of the index, so a retry is a
+plain insert and needs no cleanup path.
+
+That index is also the enforcement, not a hint. Duplicate detection catches the
+`23505` it raises rather than reading first and then inserting — a read-then-insert
+has a window between the two statements in which another request commits the same
+booking, and no amount of application care closes it.
+
+**The composite index exists because the confirmed count is a hot read.** It is
+recounted inside every payment transaction while a lock is held, so it sits on
+the critical path of the one query that must not be slow.
+
+**The check constraint pairs the timestamp with the status in both directions.**
+`confirmed` without `confirmed_at` and `confirmed_at` without `confirmed` are
+both rejected. That is what lets the roster promise a `confirmed_at` on every
+entry instead of defending against a null it can do nothing about.
+
+### Two statuses for one failed booking
+
+`payment_failed` and `seat_unavailable` are deliberately not one status. Only
+the second means money moved: the charge was accepted and then the last seat was
+found taken. Collapsing them would hide a refund obligation inside a status that
+otherwise means "nothing happened", and the void queue is exactly the thing you
+need to be able to query. `cancelled` is reserved and no endpoint writes it.
+
+### No counter column
+
+`trial_classes` holds `capacity` and nothing else about occupancy. Seat
+availability is always counted from `bookings` — `GET /api/classes` derives it
+with a filtered aggregate, and the payment transaction recounts it under a lock.
+
+A `seats_taken` column would be faster and would be the bug: it is a second
+source of truth that has to be kept in step with the rows it summarises, and
+every path that writes a booking becomes a path that can drift it. Capacity is
+read from the class row on every check, so no code anywhere hardcodes 4.
+
 ## API
 
 Base URL `http://localhost:3000`. Every endpoint accepts and returns JSON only.
@@ -289,6 +360,108 @@ booking per class. The other three are terminal and do not block a retry.
 
 A raw Postgres error is never surfaced. Any unmapped failure is a `500` with no
 error envelope.
+
+---
+
+## The last-seat race
+
+Two parents pay for the fourth seat of a four-seat class at the same moment.
+Exactly one may end `confirmed`. The rule is not "usually one" — a rule that
+holds only when the application is fast enough is not a rule.
+
+### The approach: one transaction, a pessimistic lock on the class row
+
+```sql
+BEGIN;
+  SELECT trial_class_id FROM bookings WHERE id = $1;            -- which class to lock
+  SELECT capacity FROM trial_classes WHERE id = $2 FOR UPDATE;  -- the mutex
+  SELECT * FROM bookings WHERE id = $1;                         -- status, re-read under the lock
+  INSERT INTO payment_attempts (...);                           -- the charge is recorded
+  SELECT count(*) FROM bookings
+    WHERE trial_class_id = $2 AND status = 'confirmed';         -- recounted, never cached
+  UPDATE bookings SET status = 'confirmed', confirmed_at = now() WHERE id = $1;
+COMMIT;
+```
+
+**Why the class row and not the booking rows.** The two payers hold *different*
+booking rows, so locking those serialises nothing. A booking belongs to exactly
+one class, which makes the class row the one object both contenders must touch.
+It also happens to serialise the second race for free: two calls paying the
+*same* booking twice queue on the same row, so `BOOKING_NOT_PENDING` is decided
+under the same lock rather than by a status read that was true a moment ago.
+
+**Why the count is taken after the lock, never before.** `capacity` comes from
+the locked row, but the confirmed total lives in `bookings`, which any other
+payer can change. A count read before acquiring the lock is a fact about the
+past. Read after it, every competitor is held at the lock until this transaction
+commits, so the number cannot move between the check and the write.
+
+**Why `pending_payment` holds no seat.** Booking creation counts only
+`confirmed`, so two parents may both hold a pending booking for the last seat.
+That is intentional: the alternative reserves a seat for an abandoned checkout.
+`CLASS_FULL` at booking time is therefore advisory — a courtesy that fails fast
+— and the payment step is the only place capacity is actually enforced.
+
+### Alternatives rejected
+
+**Optimistic locking** — a version column on `trial_classes`, bumped on confirm,
+with a retry on conflict. Rejected because by the time the conflict is detected
+the card has already been charged. The retry would either charge again or need a
+compensation path, which is more machinery than the lock, for a hot row where
+conflicts are the expected case rather than the rare one. Optimistic control
+pays off under low contention; the last seat is definitionally high contention.
+
+**Holding the seat at `pending_payment`** — count pending rows toward capacity.
+Rejected because it moves the problem rather than solving it: an abandoned
+checkout now holds a seat, so it needs an expiry, which needs a background job
+and a timeout nobody can pick correctly. It also converts every double-click
+into a refused booking.
+
+**`SERIALIZABLE` isolation** — let Postgres detect the anomaly. Rejected for the
+same reason as optimistic locking: it surfaces as a serialization failure the
+application must retry, after the charge. `FOR UPDATE` blocks *before* any money
+moves, which is the ordering that matters.
+
+**A unique constraint on (class, seat_number)** — make the database refuse the
+fifth seat outright. Rejected because trial classes have no seat identity to
+model; inventing one turns a capacity change into a data migration.
+
+### Tradeoffs accepted
+
+**Payments for one class are serialised.** Throughput per class is bounded by
+transaction duration. This is the cost being paid deliberately: contention is
+scoped to a single class row, so classes do not block each other, and a trial
+class holds single-digit seats.
+
+**The mock charge runs inside the transaction.** It is a local insert, so it
+costs nothing today. A real gateway call must not stay here — it would hold a
+row lock across a network round trip, and a provider timeout would become a
+class-wide outage. The fix is to charge first and hold the lock only around the
+recount and the confirm, accepting that a crash between the two leaves a charge
+to reconcile. Called out rather than pre-built, because the reconciliation path
+is the larger half of that change.
+
+**There is no `lock_timeout`.** A stuck transaction blocks other payers for that
+class indefinitely. This costs liveness, never correctness, and is why lock wait
+time on `trial_classes` is on the monitoring list.
+
+**The loser is charged.** `seat_unavailable` means a successful charge with no
+seat, and nothing in this codebase voids it. That is a deliberate boundary: the
+status exists precisely so the obligation is queryable, and the void belongs to
+the payment provider integration that does not exist here.
+
+### Where each invariant is enforced
+
+| Invariant | Enforced by |
+| --- | --- |
+| No duplicate live booking per student + class | Postgres partial unique index |
+| `confirmed` always has a `confirmed_at` | Postgres check constraint |
+| A failed payment never confirms | Service: status written before the confirm branch is reachable |
+| Confirmed never exceeds capacity | Service: recount under `FOR UPDATE` on the class row |
+
+The first two survive anything that writes to the database, including psql. The
+last two need the transaction, so they live in `service.ts` — which is why tests
+import the service directly rather than driving it over HTTP.
 
 ---
 

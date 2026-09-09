@@ -133,6 +133,12 @@ the instructions rather than left to interpretation.
   `23505`.
 - **Every endpoint exercised with curl** against seeded data, including each
   error code and the empty-roster case in both directions.
+- **The documented setup run from an empty database.** The three migrations were
+  applied incrementally as they were written, which never tests the path a
+  reviewer takes. I dropped every table, the enum and the migration bookkeeping,
+  then ran the README's commands from scratch: three migrations applied, four
+  foreign keys, both indexes and all three constraints present, seed correct, and
+  the suite and the browser run green against the rebuilt database.
 - **Eight tests importing the service directly**, each building its own parent,
   student and class so no test depends on seeded rows or on what ran before it.
 - **Both race tests checked against a deliberately broken implementation**, as

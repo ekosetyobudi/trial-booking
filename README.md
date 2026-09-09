@@ -18,6 +18,10 @@ bun run db:seed
 bun run dev
 ```
 
+Those five commands were last run in that order against a completely empty
+database, so the migration chain is known to build the schema from nothing rather
+than only from the state it was written against.
+
 The seed creates three classes of capacity 4 with 1, 3, and 4 confirmed bookings,
 so the open, one-seat-left, and full cases are all reachable without setup. It
 also leaves one student already confirmed in the open class, so a duplicate
@@ -528,9 +532,13 @@ The roster has no UI. It is served by `GET /api/classes/[id]/roster`.
 bun run test
 ```
 
+These run against the same database as the app, so `bun run db:migrate` has to
+have been run first. `DATABASE_URL` is read from `.env`.
+
 Tests import the service directly rather than going through HTTP, so a failure
 points at the invariant rather than at routing or serialisation. Each test builds
-its own parent, student and class and never reads a seeded row.
+its own parent, student and class and never reads a seeded row, so the seed can
+be left alone or wiped without changing the result.
 
 | Test                                         | Proves                                                                           |
 | -------------------------------------------- | -------------------------------------------------------------------------------- |

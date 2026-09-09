@@ -64,6 +64,24 @@ class — and passes ten out of ten with it restored. I applied the same standar
 to the second race test added later: with `FOR UPDATE` removed it confirms one
 booking twice and records two charges for it, five runs out of five.
 
+**Three schema omissions I accepted and later reversed.** At the schema stage the
+agent listed what it had deliberately left out rather than adding it silently:
+no `payment_attempts` rows in the seed, no `CHECK (capacity > 0)`, and no unique
+constraint on `parents.email`. Flagging them instead of quietly including them
+was the right behaviour, and I accepted all three at the time because the
+invariants that carry the exercise were still unwritten.
+
+Reviewing that call with time left over, all three were wrong. The seed had no
+failed payment in it, so the one status meaning money moved and nothing was
+seated could only be produced by driving the API first — and the brief asks for
+that case in the seed. `capacity` is the only input to every seat check, so a
+non-positive value would make `CLASS_FULL` permanent and unexplainable. And an
+email is what identifies a parent, so a duplicate row misfiles every booking
+under it. All three are in now. The lesson is not that the agent was careless:
+it named each omission clearly. It is that an omission accepted under time
+pressure needs revisiting once the pressure is off, and nothing prompts you to
+do that except deciding to.
+
 I also rejected the initial reading of `CLASS_FULL`. Counting
 `confirmed + pending` against capacity is a defensible reading of the words and
 the wrong one here, because a pending booking holds no seat; it would also have
@@ -110,8 +128,9 @@ the instructions rather than left to interpretation.
 - **Constraints probed directly against Postgres**, not assumed from the
   migration: the check constraint rejects both directions with `23514`, the
   partial unique index rejects a second live booking with `23505` while
-  accepting one after a terminal status, and `capacity_positive` rejects 0 and
-  -1 while accepting 1.
+  accepting one after a terminal status, `capacity_positive` rejects 0 and -1
+  while accepting 1, and `parents_email_unique` rejects a repeated address with
+  `23505`.
 - **Every endpoint exercised with curl** against seeded data, including each
   error code and the empty-roster case in both directions.
 - **Eight tests importing the service directly**, each building its own parent,

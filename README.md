@@ -31,7 +31,7 @@ Five tables. `payment_attempts` records every charge; everything else is the
 booking chain.
 
 ```
-parents(id, name, email)
+parents(id, name, email unique)
 students(id, parent_id -> parents, name)
 trial_classes(id, subject, starts_at, capacity default 4)
 bookings(id, student_id -> students, trial_class_id -> trial_classes,
@@ -42,7 +42,7 @@ payment_attempts(id, booking_id -> bookings, succeeded, failure_reason, created_
 `status` is a Postgres enum, not a text column, so an unknown status fails at
 write time rather than surviving in a row nobody reads until it breaks a count.
 
-### Four constraints, and why each exists
+### Five constraints, and why each exists
 
 ```sql
 CREATE UNIQUE INDEX bookings_one_live_per_student_class
@@ -56,6 +56,8 @@ ALTER TABLE bookings ADD CONSTRAINT confirmed_at_consistent
 
 ALTER TABLE trial_classes ADD CONSTRAINT capacity_positive
   CHECK (capacity > 0);
+
+ALTER TABLE parents ADD CONSTRAINT parents_email_unique UNIQUE (email);
 ```
 
 **The unique index is partial, and it covers `pending_payment` as well as
@@ -83,6 +85,11 @@ entry instead of defending against a null it can do nothing about.
 **Capacity must be positive.** It is the only input to every seat check, so a
 zero or negative value would make `CLASS_FULL` permanent and unexplainable. A
 class with no seats is not a class.
+
+**A parent's email is unique.** It is what identifies them, so two rows sharing
+one are the same person recorded twice, and every booking under the duplicate is
+filed against the wrong parent. Cheaper to refuse the second row than to merge
+two histories later.
 
 ### Two statuses for one failed booking
 
